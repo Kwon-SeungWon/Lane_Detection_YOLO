@@ -1,0 +1,3 @@
+~bag_file: /home/kwon/lane_ws/src/lane_detection_240830/lane_dataset_rosbag/2024-08-12-17-47-07.bag
+~topic_name: /zed2/zed_node/right/image_rect_color
+~output_path: /home/kwon/lane_ws/src/lane_detection_240830/videos/output_video.mp4

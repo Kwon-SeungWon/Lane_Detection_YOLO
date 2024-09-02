@@ -1,0 +1,7 @@
+<launch>
+    <node pkg="lane_detection" type="lane_detection_node.py" name="lane_detection_node" output="screen">
+        <param name="~bag_file" value="/home/kwon/lane_ws/src/lane_dataset_rosbag/2024-08-12-17-47-07.bag" />
+        <param name="~topic_name" value="/zed2/zed_node/right/image_rect_color" />
+        <param name="~output_path" value="/home/kwon/lane_ws/src/lane_detection_240830/videos/output_video.mp4" />
+    </node>
+</launch>
