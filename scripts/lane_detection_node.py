@@ -1,21 +1,25 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from cv_bridge import CvBridge
+import time
 import rospy
 import rosbag
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-import numpy as np
-import cv2
-from ultralytics import YOLO
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import torch
 
 class ROSBagLaneDetection:
-    def __init__(self, bag_file, topic_name, model, frame_processor, output_path):
+    def __init__(self, bag_file, topic_name, model, frame_processor, output_path, conf_threshold=0.55, iou_threshold=0.001):
         self.bag_file = bag_file
         self.topic_name = topic_name
         self.model = model
         self.frame_processor = frame_processor
         self.output_path = output_path
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
 
-        # Initialize the CvBridge instance
+        # Initialize CvBridge instance
         self.bridge = CvBridge()
 
         # Initialize video properties
@@ -24,6 +28,7 @@ class ROSBagLaneDetection:
         self.bag = None
         self.out = None
 
+        # Open the ROS bag file and initialize video properties
         self._open_bag()
         self._initialize_video_properties()
 
@@ -38,11 +43,15 @@ class ROSBagLaneDetection:
         if first_frame is None:
             raise RuntimeError("Failed to retrieve the first frame. Ensure the bag file and topic are correct.")
         
-        self.frame_width = first_frame.shape[1]  # Width of the frame
-        self.frame_height = first_frame.shape[0]  # Height of the frame
+        # Set frame width and height from the first frame
+        self.frame_width = first_frame.shape[1]  
+        self.frame_height = first_frame.shape[0]  
+        
+        # Initialize video writer for output
         self.out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*'mp4v'), 5, (self.frame_width, self.frame_height))
-    
+
     def _get_first_frame(self):
+        # Retrieve the first frame from the ROS bag
         for topic, msg, _ in self.bag.read_messages(topics=[self.topic_name]):
             try:
                 frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -54,23 +63,58 @@ class ROSBagLaneDetection:
         print("No frames were retrieved from the specified topic.")
         return None
 
+    def _preprocess_image(self, frame):
+        # Convert image to YUV color space
+        yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+        
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to the Y channel
+        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(12, 12))
+        yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
+        
+        # Convert back to BGR color space
+        equalized_frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+
+        sharpening_kernel = np.array([[0, -1, 0],
+                                      [-1, 5, -1],
+                                      [0, -1, 0]])
+
+        # Apply the sharpening filter to the frame
+        sharpened_frame = cv2.filter2D(equalized_frame, -1, sharpening_kernel)
+
+        return sharpened_frame
+
+
     def run(self):
         if self.bag is None:
             raise RuntimeError("ROS bag not opened. Cannot run the processing.")
-        
+
+        start_time = time.time()
+        frame_count = 0
+
         total_messages = self.bag.get_message_count(self.topic_name)
+        executor = ThreadPoolExecutor(max_workers=2)  # Thread pool for parallel processing
         with tqdm(total=total_messages, desc="Processing Frames") as pbar:
             for topic, msg, _ in self.bag.read_messages(topics=[self.topic_name]):
-                frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+                try:
+                    frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+                except Exception as e:
+                    print(f"Error converting ROS Image message: {e}")
+                    continue
 
-                # YOLO model prediction
-                results = self.model.predict(frame)
+                # Preprocess the frame (histogram equalization)
+                preprocessed_frame = self._preprocess_image(frame)
 
-                # Projection to frame for prediction result
-                processed_frame = self.frame_processor.process_frame(frame, results)
+                # Run YOLO prediction asynchronously
+                future = executor.submit(self._predict_and_process, preprocessed_frame)
+                try:
+                    processed_frame = future.result()  # Get the prediction result
+                    self.out.write(processed_frame)
+                except Exception as e:
+                    print(f"Error processing frame: {e}")
+                    continue
 
-                # Save the video file
-                self.out.write(processed_frame)
+                frame_count += 1
                 pbar.update(1)
 
                 # Visualize the result frame
@@ -78,7 +122,28 @@ class ROSBagLaneDetection:
                 if cv2.waitKey(1) & 0xFF == 27:  # Press ESC to exit
                     break
 
+        total_time = time.time() - start_time
+        avg_fps = frame_count / total_time
+        print(f"Total processing time: {total_time:.2f} seconds, Average FPS: {avg_fps:.2f}")
+
         self._clean_up()
+
+    def _predict_and_process(self, frame):
+        start_frame_time = time.time()
+
+        # YOLO model prediction with confidence and IoU thresholds
+        results = self.model.predict(frame, conf=self.conf_threshold, iou=self.iou_threshold)
+
+        # Apply Soft-NMS to improve detection
+        # results = self._soft_nms(results)
+
+        # Process the frame with the detection results
+        processed_frame = self.frame_processor.process_frame(frame, results)
+
+        elapsed_time = time.time() - start_frame_time
+        print(f"Frame processed in {elapsed_time:.2f} seconds")
+        
+        return processed_frame
 
     def _clean_up(self):
         if self.out is not None:
@@ -102,8 +167,8 @@ class FrameProcessor:
         overlay = frame.copy()  # Create a copy of the frame for overlay
 
         for result in results:
-            boxes = result.boxes  # Bounding boxes object
-            masks = result.masks  # Masks object
+            boxes = result.boxes
+            masks = result.masks
 
             # If masks are available, process them
             if masks:
@@ -113,8 +178,6 @@ class FrameProcessor:
 
                     # Convert mask tensor to numpy array and then to uint8
                     mask_np = mask.cpu().numpy().astype(np.uint8)
-
-                    # Resize the mask to match the original image size if necessary
                     mask_np = cv2.resize(mask_np, (frame.shape[1], frame.shape[0]))
 
                     # Find contours from the mask
@@ -122,14 +185,8 @@ class FrameProcessor:
 
                     # Draw the contours on the overlay with transparency
                     for contour in contours:
-                        # Draw a filled contour with transparency
                         cv2.drawContours(overlay, [contour], -1, self.colors.get(lane_type, (255, 255, 255)), thickness=cv2.FILLED)
-
-                        # Optional: Draw a thicker contour to act as a border
                         cv2.drawContours(frame, [contour], -1, (0, 0, 0), thickness=2)
-
-                        # Draw the contours on the overlay
-                        cv2.polylines(frame, [contour], isClosed=False, color=self.colors.get(lane_type, (255, 255, 255)), thickness=3)
 
                     # Draw label and confidence at the center of the lane
                     if len(contours) > 0:
@@ -141,7 +198,7 @@ class FrameProcessor:
                             cv2.putText(overlay, label, (cX, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors.get(lane_type, (255, 255, 255)), 2, cv2.LINE_AA)
 
         # Apply the overlay with transparency
-        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+        cv2.addWeighted(overlay, 0.35, frame, 0.5, 0, frame)
 
         return frame
 
@@ -149,12 +206,17 @@ class FrameProcessor:
 if __name__ == "__main__":
     rospy.init_node('lane_detection_node')
 
+    # Retrieve parameters from the ROS parameter server
     bag_file = rospy.get_param('~bag_file', '/home/kwon/lane_ws/src/lane_dataset_rosbag/2024-08-12-17-47-07.bag')
     topic_name = rospy.get_param('~topic_name', '/zed2/zed_node/right/image_rect_color')
-    output_path = rospy.get_param('~output_path', '/home/kwon/lane_ws/src/lane_detection_240830/videos/output_video_segment1.mp4')
+    output_path = rospy.get_param('~output_path', '/home/kwon/lane_ws/src/lane_detection_240830/videos/output_video_240910_yolov8_thresold60_iouthreshold5.mp4')
 
-    model = YOLO('/home/kwon/lane_ws/yolov8_lane_dataset/runs/segment/train/weights/best.pt')
+    # YOLOv8m model
+    model = YOLO('/home/kwon/lane_ws/yolov8_lane_dataset/runs/segment/train9/weights/best.pt')
+
+    # Frame processor
     frame_processor = FrameProcessor()
 
+    # Lane detection pipeline
     lane_detection = ROSBagLaneDetection(bag_file, topic_name, model, frame_processor, output_path)
     lane_detection.run()

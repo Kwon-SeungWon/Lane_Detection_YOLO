@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   rospy
   sensor_msgs
+  rosbag
 )
 
 ## System dependencies are found with CMake's conventions
@@ -205,5 +206,5 @@ include_directories(
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
 
-catkin_install_python(PROGRAMS scripts/lane_detection_node.py
+catkin_install_python(PROGRAMS scripts/lane_detection_node.py 
                       DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
